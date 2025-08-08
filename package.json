@@ -1,0 +1,20 @@
+{
+  "name": "rinha-backend-bun",
+  "version": "1.0.0",
+  "description": "",
+  "main": "dist/index.js",
+  "author": "Emerson Costa / @4emcos",
+  "scripts": {
+    "build": "tsgo",
+    "start": "bun dist/index.js",
+    "dev:watch": "bun --watch src/index.ts"
+  },
+  "dependencies": {
+    "@types/bun": "^1.2.19",
+    "@typescript/native-preview": "7.0.0-dev.20250805.1"
+  },
+  "devDependencies": {
+    "prettier": "^3.6.2",
+    "typescript": "^5.5.3"
+  }
+}
