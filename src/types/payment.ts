@@ -1,6 +1,6 @@
 interface Payment {
   correlationId: string
-  amount: string
+  amount: number
 }
 
 interface DefaultPayment extends Payment {
@@ -10,4 +10,10 @@ interface DefaultPayment extends Payment {
 
 interface ProcessedPayment extends DefaultPayment {
   processed?: boolean
+  useFallback?: boolean
+}
+
+interface PaymentRequestStats {
+  success: boolean
+  useFallback: boolean
 }

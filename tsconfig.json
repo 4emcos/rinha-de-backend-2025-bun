@@ -1,8 +1,10 @@
 {
   "compilerOptions": {
-    "target": "ES2021",
+    "target": "ESNext",
     "module": "commonjs",
-    "typeRoots": ["./node_modules/@types"],
+    "typeRoots": [
+      "./node_modules/@types"
+    ],
     "resolveJsonModule": true,
     "allowJs": true,
     "outDir": "dist",

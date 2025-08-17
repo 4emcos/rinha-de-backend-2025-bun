@@ -5,34 +5,36 @@ export class MemoryDatabaseClient {
     this.socketPath = socketPath
   }
 
-  async storePayment(payment: ProcessedPayment): Promise<boolean> {
-    try {
-      const res = await fetch(`http://localhost/store`, {
-        method: 'POST',
-        body: JSON.stringify({ payment }),
-        headers: { 'Content-Type': 'application/json' },
-        unix: this.socketPath
-      })
-      const data = await res.json()
-      return data.success
-    } catch (error) {
-      console.error('Failed to store payment via UDS client:', error)
-      return false
-    }
+  async storePayment(payment: ProcessedPayment): Promise<void> {
+    fetch(`http://localhost/store`, {
+      method: 'POST',
+      body: JSON.stringify({ payment }),
+      unix: this.socketPath,
+      headers: {
+        Connection: 'keep-alive'
+      }
+    }).catch(err => {
+      console.error('Store payment error:', err)
+    })
   }
 
-  async getAllPayments(): Promise<ProcessedPayment[]> {
+  async getPaymentsByRange(from: string, to: string): Promise<string> {
     try {
-      const res = await fetch(`http://localhost/getAll`, {
-        method: 'GET',
-        unix: this.socketPath
-      })
+      const res = await fetch(
+        `http://localhost/getByRange?from=${from}&to=${to}`,
+        {
+          method: 'GET',
+          unix: this.socketPath,
+          headers: {
+            Connection: 'keep-alive'
+          }
+        }
+      )
 
-      const data = await res.json()
-      return data.success ? data.payments : []
+      return await res.json()
     } catch (error) {
       console.error('Failed to get all payments via UDS client:', error)
-      return []
+      return ''
     }
   }
 }

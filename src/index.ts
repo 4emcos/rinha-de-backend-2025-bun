@@ -1,194 +1,202 @@
 import { request } from 'undici'
-import { Mutex } from './mutex'
 import { serve } from 'bun'
 import { MemoryDatabaseClient } from './in-memory-database-client'
+import { PaymentQueue } from './payment-queue'
+import { CONFIG } from './configs'
 
 let paymentTimeout = 0
-let globalErrorTime = 0
 
 const memoryDbClient = new MemoryDatabaseClient(Bun.env.WRITER_SOCKET_PATH)
-const healthCheckRoutine = async () => {
-  try {
-    const { statusCode, body } = await request(
-      Bun.env.PAYMENT_PROCESSOR_DEFAULT + '/payments/service-health',
-      { method: 'GET' }
-    )
-    if (statusCode === 200) {
-      const health: any = await body.json()
-      if (health.minResponseTime > 0) {
-        paymentTimeout = health.minResponseTime
-        console.log(`Updated paymentTimeout to ${paymentTimeout}ms`)
-      }
-      console.log('Health check: Healthy')
-    } else {
-      console.error(`Health check: Unhealthy (status ${statusCode})`)
-      globalErrorTime = Date.now()
-    }
-  } catch (error) {
-    console.error('Health check: Error', error)
-    globalErrorTime = Date.now()
-  }
-}
-
+const paymentQueue = new PaymentQueue()
 const requestDefaultPayment = async (
   requestBody: DefaultPayment
-): Promise<boolean> => {
-  const { statusCode, body } = await request(
-    Bun.env.PAYMENT_PROCESSOR_DEFAULT + '/payments/',
-    {
-      method: 'POST',
-      body: JSON.stringify(requestBody),
-      headers: {
-        'Content-Type': 'application/json'
+): Promise<PaymentRequestStats> => {
+  while (true) {
+    const { statusCode } = await request(
+      Bun.env.PAYMENT_PROCESSOR_DEFAULT + '/payments/',
+      {
+        method: 'POST',
+        body: JSON.stringify(requestBody),
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      }
+    )
+
+    if (statusCode === 200) {
+      return {
+        success: true,
+        useFallback: false
       }
     }
-  )
-  return statusCode === 200
-}
 
-const inMemoryPayments: Payment[] = []
-const paymentsMutex = new Mutex()
-const processPayments = async () => {
-  const processBatch = async (batch: Payment[]) => {
-    if (batch.length === 0) return []
-
-    const now = new Date()
-    const timestamp = now.toISOString()
-    const timestampUnix = now.getTime()
-
-    return Promise.all(
-      batch.map(async payment => {
-        try {
-          const defaultPayment: DefaultPayment = {
-            ...payment,
-            requestedAt: timestamp,
-            requestedAtUnix: timestampUnix
+    if (statusCode !== 200) {
+      const { statusCode } = await request(
+        Bun.env.PAYMENT_PROCESSOR_FALLBACK + '/payments/',
+        {
+          method: 'POST',
+          body: JSON.stringify(requestBody),
+          headers: {
+            'Content-Type': 'application/json'
           }
-          const haveSuccess = await requestDefaultPayment(defaultPayment)
-          if (haveSuccess) {
-            const processedPayment = {
-              ...defaultPayment,
-              processed: true
-            }
+        }
+      )
 
-            await memoryDbClient.storePayment(processedPayment)
-            return null
-          } else {
-            await healthCheckRoutine()
-            return payment
+      if (statusCode === 200) {
+        return {
+          success: true,
+          useFallback: true
+        }
+      }
+    }
+
+    await Bun.sleep(1)
+  }
+}
+const processBatch = async (batch: Payment[]): Promise<void> => {
+  if (batch.length === 0) return
+
+  const now = new Date()
+  const timestamp = now.toISOString()
+  const timestampUnix = now.getTime()
+
+  const chunks: Payment[][] = []
+  for (let i = 0; i < batch.length; i += CONFIG.CONCURRENT_REQUESTS) {
+    chunks.push(batch.slice(i, i + CONFIG.CONCURRENT_REQUESTS))
+  }
+  const processingPromises = chunks.map(chunk =>
+    Promise.allSettled(
+      chunk.map(async payment => {
+        const defaultPayment: DefaultPayment = {
+          ...payment,
+          requestedAt: timestamp,
+          requestedAtUnix: timestampUnix
+        }
+
+        try {
+          const requestPayment = await requestDefaultPayment(defaultPayment)
+          if (requestPayment.success) {
+            await memoryDbClient.storePayment({
+              ...defaultPayment,
+              processed: true,
+              useFallback: requestPayment.useFallback
+            })
           }
         } catch (error) {
-          globalErrorTime = Date.now()
-          return payment
+          console.error('Payment processing error:', error)
         }
       })
     )
-  }
+  )
+
+  await Promise.allSettled(processingPromises)
+}
+const processPayments = async (): Promise<void> => {
+  let consecutiveEmptyBatches = 0
 
   while (true) {
-    const batchSize = 100
-    const paymentsToProcess = await paymentsMutex.withLock(async () => {
-      if (inMemoryPayments.length === 0) {
-        return []
+    try {
+      const batch = await paymentQueue.dequeue(CONFIG.BATCH_SIZE)
+
+      if (batch.length > 0) {
+        consecutiveEmptyBatches = 0
+        await processBatch(batch)
+      } else {
+        consecutiveEmptyBatches++
       }
 
-      return inMemoryPayments.splice(
-        0,
-        Math.min(batchSize, inMemoryPayments.length)
-      )
-    })
+      const queueLength = paymentQueue.length
+      let waitTime = paymentTimeout || CONFIG.MIN_WAIT_TIME
 
-    if (paymentsToProcess.length === 0) {
-      await new Promise(resolve => setTimeout(resolve, 1))
+      if (queueLength === 0) {
+        if (consecutiveEmptyBatches > 5) {
+          waitTime = CONFIG.MAX_WAIT_TIME
+        } else {
+          waitTime = CONFIG.MIN_WAIT_TIME * 2
+        }
+      } else if (queueLength > CONFIG.QUEUE_DRAIN_THRESHOLD) {
+        waitTime = 0
+      } else {
+        waitTime = CONFIG.MIN_WAIT_TIME
+      }
 
-      continue
-    }
-
-    const results = await processBatch(paymentsToProcess)
-
-    const failedPayments = results.filter(p => p !== null)
-    if (failedPayments.length > 0) {
-      await paymentsMutex.withLock(async () => {
-        inMemoryPayments.push(...failedPayments)
-      })
-    }
-
-    const waitTime = paymentTimeout || 100
-    if (waitTime > 0) {
-      await new Promise(resolve => setTimeout(resolve, waitTime))
+      if (waitTime > 0) {
+        await Bun.sleep(waitTime)
+      }
+    } catch (error) {
+      console.error('Payment processing error:', error)
+      await Bun.sleep(CONFIG.MAX_WAIT_TIME)
     }
   }
 }
 
 async function handleRequest(request: Request): Promise<Response> {
-  const { method, url } = request
+  const { method } = request
+  const url = new URL(request.url)
+  const pathname = url.pathname
 
-  if (method === 'GET' && url.includes('/payments-summary')) {
-    const urlObj = new URL(url, 'http://localhost')
+  if (method === 'GET' && pathname === '/payments-summary') {
+    const fromStr = url.searchParams.get('from')
+    const toStr = url.searchParams.get('to')
 
-    const fromStr = urlObj.searchParams.get('from')
-    const toStr = urlObj.searchParams.get('to')
-
-    const fromUnix = fromStr ? new Date(fromStr).getTime() : 0
-    const toUnix = toStr ? new Date(toStr).getTime() : Date.now()
-
-    let totalRequests = 0
-    let totalAmount = 0
-
-    for (const p of await memoryDbClient.getAllPayments()) {
-      if (
-        p.requestedAtUnix >= fromUnix &&
-        p.requestedAtUnix <= toUnix &&
-        p.processed
-      ) {
-        totalRequests++
-        totalAmount += parseFloat(p.amount)
+    return new Response(
+      JSON.stringify(await memoryDbClient.getPaymentsByRange(fromStr, toStr)),
+      {
+        status: 200
       }
-    }
+    )
+  }
 
-    const response = {
-      default: { totalRequests, totalAmount },
-      fallback: { totalRequests: 0, totalAmount: 0 }
-    }
+  if (method === 'POST' && pathname === '/payments') {
+    const body = await request.json()
+    paymentQueue.push(body)
 
-    return new Response(JSON.stringify(response), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' }
+    return new Response(null, {
+      status: 201
     })
   }
 
-  if (method === 'POST' && url.includes('/payments')) {
-    return request.json().then(async body => {
-      await paymentsMutex.withLock(async () => {
-        inMemoryPayments.push(body)
-      })
-      return new Response(null, { status: 201 })
-    })
-  }
-  return new Response('Not found', { status: 404 })
+  return new Response(JSON.stringify({ error: 'Not found' }), {
+    status: 404,
+    headers: { 'Content-Type': 'application/json' }
+  })
 }
 
-const server = async (socketPath: string) => {
+const server = async (socketPath: string): Promise<void> => {
   try {
     processPayments().catch(err => {
-      globalErrorTime = Date.now()
       console.error('Payment processing thread error:', err)
     })
 
-    serve({
+    const serverInstance = serve({
       fetch: handleRequest,
       development: false,
-      unix: socketPath
+      unix: socketPath,
+      reusePort: true
     })
 
     await Bun.spawn(['chmod', '666', socketPath]).exited
-    console.log(`running on unix socket: ${socketPath}`)
-    await healthCheckRoutine()
+    console.log(`server running on unix socket: ${socketPath}`)
+    const shutdown = async () => {
+      console.log('Shutting down gracefully...')
+
+      try {
+        serverInstance.stop()
+
+        console.log('Shutdown complete')
+        process.exit(0)
+      } catch (error) {
+        console.error('Error during shutdown:', error)
+        process.exit(1)
+      }
+    }
+
+    process.on('SIGTERM', shutdown)
+    process.on('SIGINT', shutdown)
   } catch (err) {
-    globalErrorTime = Date.now()
     console.error('Server startup error:', err)
     process.exit(1)
   }
 }
 
-server(Bun.env.SERVICE_SOCKET_PATH).catch(console.log)
+server(Bun.env.SERVICE_SOCKET_PATH!).catch(console.error)
